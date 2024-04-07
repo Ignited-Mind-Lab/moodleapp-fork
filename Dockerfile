@@ -1,27 +1,41 @@
-# This image is based on the fat node 11 image.
-# We require fat images as neither alpine, or slim, include git binaries.
-FROM node:11
-
-# Port 8100 for ionic dev server.
-EXPOSE 8100
-
-# Port 35729 is the live-reload server.
-EXPOSE 35729
-
-# Port 53703 is the Chrome dev logger port.
-EXPOSE 53703
+## BUILD STAGE
+FROM node:18 as build-stage
 
 WORKDIR /app
 
+# Update platform dependencies
+RUN apt-get update && apt-get install libsecret-1-0 -y
+
+# Prepare native plugin
+COPY ./cordova-plugin-moodleapp/package*.json /app/cordova-plugin-moodleapp/
+RUN npm ci --prefix cordova-plugin-moodleapp
+COPY ./cordova-plugin-moodleapp/ /app/cordova-plugin-moodleapp/
+RUN npm run prod --prefix cordova-plugin-moodleapp
+
+# Prepare node dependencies
+COPY package*.json ./
+COPY patches ./patches
+RUN echo "unsafe-perm=true" > ./.npmrc
+RUN npm ci --no-audit
+
+# Build source
+ARG build_command="npm run build:prod"
 COPY . /app
+# We want emulator code in Docker images ― even for production bundles ― because they will always run in a browser environment.
+RUN cp /app/src/core/features/emulator/emulator.module.ts /app/src/core/features/emulator/emulator.module.prod.ts
+RUN ${build_command}
 
-# Install npm libraries.
-RUN npm install && rm -rf /root/.npm
+# Generate SSL certificate
+RUN mkdir /app/ssl
+RUN openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /app/ssl/certificate.key -out /app/ssl/certificate.crt -subj="/O=Moodle"
 
-# Run gulp before starting.
-RUN npx gulp
+## SERVE STAGE
+FROM nginx:alpine as serve-stage
 
-# Provide a Healthcheck command for easier use in CI.
-HEALTHCHECK --interval=10s --timeout=3s --start-period=30s CMD curl -f http://localhost:8100 || exit 1
-
-CMD ["npm", "run", "ionic:serve"]
+# Copy assets & config
+COPY --from=build-stage /app/www /usr/share/nginx/html
+COPY --from=build-stage /app/ssl/certificate.crt /etc/ssl/certificate.crt
+COPY --from=build-stage /app/ssl/certificate.key /etc/ssl/certificate.key
+COPY ./nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 443
+HEALTHCHECK --interval=10s --timeout=4s CMD curl --insecure -f https://localhost/assets/env.json || exit 1
